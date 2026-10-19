@@ -5,12 +5,10 @@ from openpyxl.styles import PatternFill
 import os
 import re
 import unicodedata
-import difflib
 import tempfile
 
 # ==========================================
-# CONFIGURACIÓN (Ocultamos los diccionarios para no alargar el código aquí, 
-# son exactamente los mismos que ya teníamos)
+# COLUMNAS REQUERIDAS POR SAP
 # ==========================================
 COLUMNAS_PROTOCOLO = [
     'ResControlProd', 'GrupoPlanificador', 'Material', 'Descripcion', 
@@ -33,8 +31,8 @@ MAPEO_BASE = {
     'NombreRecurso': ['pstotbjo', 'nombre recurso', 'recurso'],
     'Consecutivo': ['nrosecuencia', 'secuencia', 'operacion'],
     'Alistamiento': ['tiempominalistamientos', 'tiempo alistamiento'],
-    'EquipoXRecurso': ['cant equipos', 'equipo x recurso', '# equipos'],
-    'OperarioXRecurso': ['totaloperarios', 'mano de obra', 'operarios'],
+    'EquipoXRecurso': ['equiposxrecurso', 'equipos x recurso', 'equipo x recurso', 'cant equipos', 'cantequipos', '# equipos'],
+    'OperarioXRecurso': ['totaloperarios', 'total operarios', 'mano de obra', 'operarios'],
     '%Enlace': ['porenlace', 'porcenlace', '% enlace', 'enlace'],
     '%Recorte': ['porcrecorte', '% recorte', 'recorte'],
     '%Sobrepeso': ['porcsobrepeso', '% sobrepeso', 'sobrepeso'],
@@ -62,10 +60,28 @@ def es_numero_real(val):
     except ValueError:
         return False
 
-def convertir_numero(val):
+def convertir_numero_normal(val):
+    num = float(str(val).replace(',', '.'))
+    return int(num) if num.is_integer() else num
+
+def convertir_eficiencia(val):
     num = float(str(val).replace(',', '.'))
     if 0 < num <= 1.0: num = round(num * 100, 2)
     return int(num) if num.is_integer() else num
+
+def resolver_operarios_y_equipos(recurso_str, dict_mo, dict_eq):
+    rec = str(recurso_str).strip().upper()
+    maquina = None
+    if 'CAHO' in rec or 'CAM' in rec: maquina = 'CAMARA'
+    elif 'EMBM' in rec or 'EMB' in rec: maquina = 'EMB'
+    elif 'LAMI' in rec: maquina = 'LAMINA'
+    elif 'EMPI' in rec or 'IND' in rec: maquina = 'IND'
+    elif 'EMPM' in rec or 'MEP' in rec: maquina = 'MEP'
+    elif 'ROCI' in rec: return 0.0, 1
+
+    mo = dict_mo.get(maquina) if maquina else None
+    eq = dict_eq.get(maquina) if maquina else None
+    return mo, eq
 
 def ajustar_secuencia_roceado(df_base):
     col_mat = next((c for c in df_base.columns if limpiar(c) == 'material'), None)
@@ -91,9 +107,11 @@ def analizar_receta(xls):
 
     valores = {'eficiencia': None, 'ancho_molde': None, 'perimetro': None, 'velocidad': None,
                'largo_mm': None, 'ancho_mm': None, 'calibre': None, 'crudo': None, 'horneado': None}
-    dict_mo, dict_eq = {}, {}
-    filas, columnas = df_receta.shape
     
+    dict_mo = {'LAMINA': 3.5, 'CAMARA': 0.75, 'IND': 2.4, 'MEP': 2.3, 'EMB': 5.4}
+    dict_eq = {'LAMINA': 1, 'CAMARA': 1, 'IND': 5, 'MEP': 2, 'EMB': 1}
+    
+    filas, columnas = df_receta.shape
     for r in range(filas):
         for c in range(columnas):
             celda = df_receta.iat[r, c]
@@ -103,58 +121,63 @@ def analizar_receta(xls):
                 if c + 1 < columnas:
                     valor = df_receta.iat[r, c + 1]
                     if es_numero_real(valor):
-                        v_num = convertir_numero(valor)
-                        if 'eficiencia' in celda_limpia or 'efic' in celda_limpia: valores['eficiencia'] = v_num
-                        elif 'anchomm' in celda_limpia or 'ancho(mm)' in celda_limpia: valores['ancho_mm'] = v_num
-                        elif celda_limpia == 'ancho': valores['ancho_molde'] = v_num
-                        elif 'perimetro' in celda_limpia: valores['perimetro'] = v_num
-                        elif 'velocidad' in celda_limpia and 'camara' not in celda_limpia: valores['velocidad'] = v_num
-                        elif 'largo' in celda_limpia: valores['largo_mm'] = v_num
-                        elif 'calibre' in celda_limpia: valores['calibre'] = v_num
-                        elif 'crudo' in celda_limpia or 'cruda' in celda_limpia: valores['crudo'] = v_num
-                        elif 'horneado' in celda_limpia or 'horneada' in celda_limpia: valores['horneado'] = v_num
+                        if 'eficiencia' in celda_limpia or 'efic' in celda_limpia: 
+                            valores['eficiencia'] = convertir_eficiencia(valor)
+                        else:
+                            v_num = convertir_numero_normal(valor)
+                            if 'anchomm' in celda_limpia or 'ancho(mm)' in celda_limpia: valores['ancho_mm'] = v_num
+                            elif celda_limpia == 'ancho': valores['ancho_molde'] = v_num
+                            elif 'perimetro' in celda_limpia: valores['perimetro'] = v_num
+                            elif 'velocidad' in celda_limpia and 'camara' not in celda_limpia: valores['velocidad'] = v_num
+                            elif 'largo' in celda_limpia: valores['largo_mm'] = v_num
+                            elif 'calibre' in celda_limpia: valores['calibre'] = v_num
+                            elif 'crudo' in celda_limpia or 'cruda' in celda_limpia: valores['crudo'] = v_num
+                            elif 'horneado' in celda_limpia or 'horneada' in celda_limpia: valores['horneado'] = v_num
 
             val_upper = str(celda).strip().upper()
             if val_upper in ['LAMINA', 'CAMARA', 'IND', 'MEP', 'EMB']:
-                if c + 1 < columnas and es_numero_real(df_receta.iat[r, c+1]): dict_mo[val_upper] = convertir_numero(df_receta.iat[r, c+1])
-                if c + 2 < columnas and es_numero_real(df_receta.iat[r, c+2]): dict_eq[val_upper] = convertir_numero(df_receta.iat[r, c+2])
+                if c + 1 < columnas and es_numero_real(df_receta.iat[r, c+1]): 
+                    dict_mo[val_upper] = convertir_numero_normal(df_receta.iat[r, c+1])
+                if c + 2 < columnas and es_numero_real(df_receta.iat[r, c+2]): 
+                    dict_eq[val_upper] = convertir_numero_normal(df_receta.iat[r, c+2])
 
     return valores, dict_mo, dict_eq
 
 # ==========================================
 # INTERFAZ WEB (STREAMLIT)
 # ==========================================
-st.set_page_config(page_title="Actualizador SAP", page_icon="🏭", layout="centered")
+st.set_page_config(page_title="Actualizador SAP", layout="centered")
 
-st.title("🏭 Actualizador Automático SAP")
-st.write("Sube el archivo de Excel con la Base Original y la Receta. El sistema generará el Protocolo y las Especificaciones.")
+st.title("Actualizador Automatico SAP")
+st.write("Sube el archivo Excel con la Base Original y la Receta. El sistema generara el Protocolo y las Especificaciones.")
 
-# 1. Carga del archivo
 archivo_subido = st.file_uploader("Selecciona el archivo Excel", type=["xlsx", "xls", "xlsm"])
 
 if archivo_subido is not None:
-    # Leer el archivo en memoria
     xls = pd.ExcelFile(archivo_subido)
     df_base = pd.read_excel(xls, sheet_name=0)
     
-    # Extraer valores
     valores_receta, dict_mo, dict_eq = analizar_receta(xls)
     
-    st.success("✅ Archivo leído correctamente")
+    st.success("Archivo leido correctamente")
     
-    # Si falta la eficiencia, mostrar un cuadro de entrada en la web
-    eficiencia_final = valores_receta['eficiencia']
-    if eficiencia_final is None:
-        st.warning("⚠️ No se detectó la Eficiencia automáticamente.")
-        eficiencia_final = st.number_input("Ingresa el porcentaje de Eficiencia (Ej: 95):", min_value=0.0, max_value=100.0, value=90.0)
+    # Manejo de valor faltante sin ventanas de Windows
+    if valores_receta['eficiencia'] is None:
+        st.warning("No se detecto la Eficiencia de forma automatica en el archivo.")
+        entrada_eficiencia = st.number_input("Ingresa el porcentaje de Eficiencia (Ej: 95):", min_value=0.0, max_value=100.0, value=90.0)
+        valores_receta['eficiencia'] = convertir_eficiencia(entrada_eficiencia)
 
-    # Botón para procesar
-    if st.button("🚀 Procesar Archivo"):
-        with st.spinner("Construyendo plantillas para SAP..."):
+    if st.button("Procesar Archivo"):
+        with st.spinner("Sincronizando equipos, mano de obra y secuencias..."):
+            
             df_base_modificada = ajustar_secuencia_roceado(df_base.copy())
             columnas_limpias_base = {limpiar(col): col for col in df_base_modificada.columns}
 
-            # --- PROTOCOLO ---
+            col_recurso_base = next((c for c in df_base_modificada.columns if limpiar(c) in MAPEO_BASE['NombreRecurso'] or limpiar(c) == 'nombrerecurso'), None)
+            col_operarios_base = next((c for c in df_base_modificada.columns if limpiar(c) in MAPEO_BASE['OperarioXRecurso']), None)
+            col_equipos_base = next((c for c in df_base_modificada.columns if limpiar(c) in MAPEO_BASE['EquipoXRecurso']), None)
+
+            # --- 1. HOJA PROTOCOLO ---
             df_protocolo = pd.DataFrame(index=df_base_modificada.index)
             for col_sap in COLUMNAS_PROTOCOLO:
                 col_busqueda = limpiar(col_sap)
@@ -170,25 +193,22 @@ if archivo_subido is not None:
                     if not encontrada: df_protocolo[col_sap] = None
                 else: df_protocolo[col_sap] = None
 
-            if eficiencia_final is not None: df_protocolo['PorcEficiencia'] = eficiencia_final
+            if valores_receta['eficiencia'] is not None: df_protocolo['PorcEficiencia'] = valores_receta['eficiencia']
             if valores_receta['ancho_molde'] is not None: df_protocolo['Ancho'] = valores_receta['ancho_molde']
             if valores_receta['perimetro'] is not None: df_protocolo['Perimetro'] = valores_receta['perimetro']
             if valores_receta['velocidad'] is not None: df_protocolo['Velocidad'] = valores_receta['velocidad']
 
             for idx, fila in df_protocolo.iterrows():
-                recurso = str(fila.get('NombreRecurso', '')).upper()
-                maquina = None
-                if 'CAHO' in recurso or 'CAM' in recurso: maquina = 'CAMARA'
-                elif 'EMBM' in recurso or 'EMB' in recurso: maquina = 'EMB'
-                elif 'LAMI' in recurso: maquina = 'LAMINA'
-                elif 'EMPI' in recurso or 'IND' in recurso: maquina = 'IND'
-                elif 'EMPM' in recurso or 'MEP' in recurso: maquina = 'MEP'
+                recurso = fila.get('NombreRecurso')
+                mo, eq = resolver_operarios_y_equipos(recurso, dict_mo, dict_eq)
+                
+                if mo is not None: df_protocolo.at[idx, 'OperarioXRecurso'] = mo
+                if eq is not None: df_protocolo.at[idx, 'EquipoXRecurso'] = eq
+                
+                if col_operarios_base and mo is not None: df_base_modificada.at[idx, col_operarios_base] = mo
+                if col_equipos_base and eq is not None: df_base_modificada.at[idx, col_equipos_base] = eq
 
-                if maquina:
-                    if maquina in dict_mo: df_protocolo.at[idx, 'OperarioXRecurso'] = dict_mo[maquina]
-                    if maquina in dict_eq: df_protocolo.at[idx, 'EquipoXRecurso'] = dict_eq[maquina]
-
-            # --- ESPECIFICACIONES ---
+            # --- 2. HOJA ESPECIFICACIONES ---
             df_esp = pd.DataFrame(index=df_base_modificada.index)
             for col_sap in COLUMNAS_ESPECIFICACIONES:
                 col_busqueda = limpiar(col_sap)
@@ -221,7 +241,7 @@ if archivo_subido is not None:
                     if col_b in columnas_limpias_base:
                         df_base_modificada.at[idx, columnas_limpias_base[col_b]] = fila[col_p]
 
-            # --- GUARDAR EN ARCHIVO TEMPORAL ---
+            # --- 3. GUARDADO EN MEMORIA Y FORMATO ---
             with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
                 ruta_tmp = tmp.name
 
@@ -231,6 +251,7 @@ if archivo_subido is not None:
                 df_esp.to_excel(writer, sheet_name='Especificaciones', index=False)
 
             wb = openpyxl.load_workbook(ruta_tmp)
+            
             wb['Base_Modificada'].sheet_properties.tabColor = "0000FF"
             amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
@@ -243,14 +264,16 @@ if archivo_subido is not None:
                     wb['Especificaciones'].cell(row=1, column=col_idx).fill = amarillo
 
             wb.save(ruta_tmp)
-            
-            # --- BOTÓN DE DESCARGA ---
+
             with open(ruta_tmp, "rb") as file:
                 datos_excel = file.read()
+
+            # --- ANIMACIÓN Y BOTÓN DE DESCARGA ---
+            st.balloons()
+            st.success("Procesamiento completado. Tu archivo esta listo para descargar.")
             
-            st.success("🎉 ¡Archivo generado con éxito!")
             st.download_button(
-                label="📥 Descargar Actualizacion SAP",
+                label="Descargar Actualizacion SAP",
                 data=datos_excel,
                 file_name="Carga_SAP_Actualizada.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
